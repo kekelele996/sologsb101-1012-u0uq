@@ -50,6 +50,8 @@ import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
+import { useReconcile } from '@/hooks/useReconcile';
+import { qualifyStatOf } from '@/utils/rangeCaliber';
 
 interface ArrayFormValues {
   name: string;
@@ -70,6 +72,7 @@ export default function ArrayList() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const reconcile = useReconcile();
   const filter = useAppSelector(selectArrayFilter);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
 
@@ -132,9 +135,12 @@ export default function ArrayList() {
         const arrayCalibrations = calibrations.filter((calibration) =>
           instrumentIds.has(calibration.instrumentId)
         );
-        const unqualified = arrayCalibrations.filter(
-          (calibration) => calibration.responseVerdict === '不合格'
-        ).length;
+        // 合格率与标定台同一条同档口径：收集本台阵仪器的同档点，换档首条/缺档挂起不计
+        const arrayPoints = arrayInstruments.flatMap(
+          (instrument) => reconcile.pointsOfInstrument(instrument.id)
+        );
+        const qualify = qualifyStatOf(arrayPoints);
+        const unqualified = qualify.qualifiedCount === null ? 0 : qualify.eligibleCount - qualify.qualifiedCount;
         const pendingReplace = replaces.filter(
           (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'
         ).length;
@@ -152,15 +158,13 @@ export default function ArrayList() {
           instrumentCount: arrayInstruments.length,
           calibrationCount: arrayCalibrations.length,
           unqualified,
+          suspendedCount: qualify.suspendedCount,
           pendingReplace,
           computedApertureKm: computed,
-          qualifyRate:
-            arrayCalibrations.length === 0
-              ? 0
-              : round(((arrayCalibrations.length - unqualified) / arrayCalibrations.length) * 100, 1),
+          qualifyRate: qualify.qualifyRate,
         };
       }),
-    [calibrations, filtered, instruments, replaces, stations]
+    [calibrations, filtered, instruments, reconcile, replaces, stations]
   );
 
   const totals = useMemo(
@@ -384,11 +388,16 @@ export default function ArrayList() {
                   <StatBadge label="台站" value={card.stationCount} suffix="个" size="small" tone="info" />
                   <StatBadge label="仪器" value={card.instrumentCount} suffix="台" size="small" />
                   <StatBadge
-                    label="标定合格率"
-                    value={card.qualifyRate}
-                    percent={card.qualifyRate}
+                    label="标定合格率（同档）"
+                    value={card.qualifyRate === null ? '—' : card.qualifyRate}
+                    percent={card.qualifyRate ?? 0}
                     size="small"
                     tone={card.unqualified > 0 ? 'warning' : 'success'}
+                    tip={
+                      card.qualifyRate === null
+                        ? '暂无可同档比较的标定（换档首条/缺档挂起不计）'
+                        : `换档首条/缺档共 ${card.suspendedCount} 条挂起不计`
+                    }
                   />
                 </div>
                 <Space direction="vertical" size={4} style={{ fontSize: 13, color: '#5b6b78' }}>

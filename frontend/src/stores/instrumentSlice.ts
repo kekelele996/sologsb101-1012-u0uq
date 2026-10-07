@@ -6,6 +6,7 @@ import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/tool
 import { db, createId, watchTable } from '@/utils/db';
 import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
 import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
+import { DEFAULT_RANGE_GEAR, buildChannelCode } from '@/types/measure';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -53,7 +54,32 @@ export const createInstrument = createAsyncThunk(
     }
     const now = Date.now();
     const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
-    await db.instruments.put(row);
+    // 仪器与计量站通道同事务落库：通道不存在则补一条默认档通道（通道号 = 台站码-类型后缀），
+    // 使台网中心后续标定能按通道号对上；台站缺失时不强行建通道（留给对账页挂账）。
+    await db.transaction('rw', [db.instruments, db.stations, db.channels], async () => {
+      await db.instruments.put(row);
+      const station = await db.stations.get(row.stationId);
+      if (station) {
+        const code = buildChannelCode(station.code, row.type);
+        const existing = await db.channels.where('channelCode').equals(code).first();
+        if (!existing) {
+          await db.channels.put({
+            id: createId('ch'),
+            channelCode: code,
+            instrumentId: row.id,
+            stationId: row.stationId,
+            currentGear: DEFAULT_RANGE_GEAR,
+            component: '',
+            remark: '随仪器登记自动补建默认档通道',
+            createdAt: now,
+            updatedAt: now,
+          });
+        } else if (!existing.instrumentId) {
+          // 计量站先行建档的通道：装上仪器后回填关联
+          await db.channels.update(existing.id, { instrumentId: row.id, updatedAt: now });
+        }
+      }
+    });
     // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
     const dueInDays = daysUntilDue(null, row.installDate);
     return { row, dueInDays };

@@ -1,4 +1,6 @@
-/** 响应结论 */
+import type { RangeGear } from '@/types/measure';
+import { GEAR_GAIN_FACTOR } from '@/types/measure';
+
 export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
 export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待判定'];
@@ -8,6 +10,18 @@ export interface Calibration {
   id: string;
   /** 被标定仪器 */
   instrumentId: string;
+  /**
+   * 对账通道 id（台网中心 ↔ 计量站按通道号对账后回填）。
+   * 对不上通道时为空，记录挂起，不强行归并。
+   */
+  channelId: string;
+  /** 通道号（冗余，对账主键，便于两侧直接比对） */
+  channelCode: string;
+  /**
+   * 本次标定时生效的量程档（计量站通道调整记录解析得到）。
+   * 旧数据升级时按通道补默认档；补不出为空串 ''，在对账页单列。
+   */
+  gear: RangeGear | '';
   /** 标定日期 */
   date: string;
   /** 灵敏度（V·s/m） */
@@ -29,6 +43,10 @@ export interface Calibration {
 /**
  * 自动初判：灵敏度落在合理区间且自噪不高于阈值判合格。
  * 阈值按台网常规口径给出，最终以标定报告为准。
+ *
+ * 灵敏度合格区间按「标准档」给出；其它档位先除以该档相对标准档的增益因子
+ * 换算回标准档再判，避免高/低增益档被固定区间误判（注意：这只用于合格区间判定，
+ * 同档灵敏度变化与合格率不做跨档归一，见 utils/rangeCaliber.ts）。
  */
 export const SENSITIVITY_RANGE: Record<string, { min: number; max: number }> = {
   宽频带: { min: 800, max: 3000 },
@@ -41,11 +59,14 @@ export const SELF_NOISE_LIMIT = 3.5;
 export function judgeCalibration(
   type: string,
   sensitivity: number,
-  selfNoise: number
+  selfNoise: number,
+  gear: RangeGear | '' = '标准档'
 ): ResponseVerdict {
   if (!Number.isFinite(sensitivity) || !Number.isFinite(selfNoise)) return '待判定';
+  const factor = gear && gear in GEAR_GAIN_FACTOR ? GEAR_GAIN_FACTOR[gear] : 1;
+  const normalizedSensitivity = factor > 0 ? sensitivity / factor : sensitivity;
   const range = SENSITIVITY_RANGE[type] ?? { min: 0, max: Number.MAX_SAFE_INTEGER };
-  if (sensitivity < range.min || sensitivity > range.max) return '不合格';
+  if (normalizedSensitivity < range.min || normalizedSensitivity > range.max) return '不合格';
   if (selfNoise > SELF_NOISE_LIMIT) return '不合格';
   return '合格';
 }

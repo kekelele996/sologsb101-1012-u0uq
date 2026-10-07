@@ -13,6 +13,8 @@ import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
+import { reconcileSides } from '@/utils/reconcile';
+import { buildCaliberPoints } from '@/utils/rangeCaliber';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -49,7 +51,8 @@ export const createCalibration = createAsyncThunk(
     const verdict = judgeCalibration(
       instrument?.type ?? '宽频带',
       payload.sensitivity,
-      payload.selfNoise
+      payload.selfNoise,
+      payload.gear
     );
     const row: Calibration = {
       ...payload,
@@ -77,7 +80,13 @@ export const updateCalibration = createAsyncThunk(
     const instrument = existing ? await db.instruments.get(existing.instrumentId) : undefined;
     const nextSensitivity = payload.patch.sensitivity ?? existing?.sensitivity ?? 0;
     const nextNoise = payload.patch.selfNoise ?? existing?.selfNoise ?? 0;
-    const verdict = judgeCalibration(instrument?.type ?? '宽频带', nextSensitivity, nextNoise);
+    const nextGear = payload.patch.gear ?? existing?.gear ?? '标准档';
+    const verdict = judgeCalibration(
+      instrument?.type ?? '宽频带',
+      nextSensitivity,
+      nextNoise,
+      nextGear
+    );
     await db.calibrations.update(payload.id, {
       ...payload.patch,
       responseVerdict: payload.patch.responseVerdict ?? verdict,
@@ -282,11 +291,19 @@ export const selectReplacesOfInstrument = (
   return state.calibration.replaces.filter((row) => row.instrumentId === instrumentId);
 };
 
-/** 标定 id → 灵敏度变化（相对同仪器上一次标定） */
+/**
+ * 标定 id → 灵敏度变化（同档链式口径）。
+ * 与趋势图、合格率共用同一比较器：换档后新档首条、档位缺失的记录 comparable=false。
+ */
 export const selectSensitivityDeltas = (
   state: WithCalibration
 ): Record<string, ReturnType<typeof sensitivityDelta>> => {
   const result: Record<string, ReturnType<typeof sensitivityDelta>> = {};
+  const reconcile = reconcileSides({
+    channels: state.measure.channels,
+    adjustments: state.measure.adjustments,
+    calibrations: state.calibration.calibrations,
+  });
   const grouped = new Map<string, Calibration[]>();
   state.calibration.calibrations.forEach((row) => {
     const list = grouped.get(row.instrumentId) ?? [];
@@ -294,10 +311,8 @@ export const selectSensitivityDeltas = (
     grouped.set(row.instrumentId, list);
   });
   grouped.forEach((list) => {
-    const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
-    sorted.forEach((row, index) => {
-      const previous = index > 0 ? sorted[index - 1].sensitivity : null;
-      result[row.id] = sensitivityDelta(row.sensitivity, previous);
+    buildCaliberPoints(list, reconcile.gearMap).forEach((point) => {
+      result[point.calibration.id] = point.delta;
     });
   });
   return result;

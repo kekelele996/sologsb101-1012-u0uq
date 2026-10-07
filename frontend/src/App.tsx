@@ -10,6 +10,7 @@ import {
   DashboardOutlined,
   ExperimentOutlined,
   GlobalOutlined,
+  SlidersOutlined,
   SwapOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -30,6 +31,11 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import {
+  selectChannels,
+  selectAdjustments,
+  startMeasureSubscription,
+} from '@/stores/measureSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -37,6 +43,7 @@ const { Header, Sider, Content, Footer } = Layout;
 /** 按当前路径决定导航高亮项 */
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
+  if (pathname.startsWith('/measure')) return ROUTES.measure;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
   if (pathname.startsWith('/stations/') && currentArrayId) return ROUTES.stations(currentArrayId);
@@ -54,6 +61,8 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const channels = useAppSelector(selectChannels);
+  const adjustments = useAppSelector(selectAdjustments);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +76,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startMeasureSubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -83,6 +93,7 @@ export default function App() {
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const failedAdjustments = adjustments.filter((row) => row.syncState === '同步失败').length;
 
   return (
     <>
@@ -116,7 +127,12 @@ export default function App() {
                 label: currentArray ? `台站仪器 · ${currentArray.name}` : '台站仪器（先选台阵）',
                 disabled: !currentArrayId,
               },
-              { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
+              { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台（台网中心）' },
+              {
+                key: ROUTES.measure,
+                icon: <SlidersOutlined />,
+                label: '通道量程档（计量站）',
+              },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
@@ -131,6 +147,9 @@ export default function App() {
               </span>
               <span>
                 <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}
+              </span>
+              <span>
+                <SlidersOutlined /> 通道 {channels.length} · 调整同步失败 {failedAdjustments}
               </span>
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}

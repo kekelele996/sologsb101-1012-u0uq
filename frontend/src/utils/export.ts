@@ -12,23 +12,35 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import type { MeasureChannel, RangeAdjustment } from '@/types/measure';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
-/** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+/** 备份集合键名（计量站 channels/adjustments 与台网中心 calibrations 两侧都在） */
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'channels',
+  'calibrations',
+  'adjustments',
+  'replaces',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.toArray(),
-    db.stations.toArray(),
-    db.instruments.toArray(),
-    db.calibrations.toArray(),
-    db.replaces.toArray(),
-  ]);
+  const [arrays, stations, instruments, channels, calibrations, adjustments, replaces] =
+    await Promise.all([
+      db.arrays.toArray(),
+      db.stations.toArray(),
+      db.instruments.toArray(),
+      db.channels.toArray(),
+      db.calibrations.toArray(),
+      db.adjustments.toArray(),
+      db.replaces.toArray(),
+    ]);
   return {
     app: 'gbseisarray',
     dbVersion: DB_VERSION,
@@ -36,10 +48,12 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     arrays,
     stations,
     instruments,
+    channels,
     calibrations,
+    adjustments,
     replaces,
   };
-}
+};
 
 /** 校验外部 JSON 是否为本站可识别的备份文件 */
 export function validateBackup(input: unknown): {
@@ -55,8 +69,22 @@ export function validateBackup(input: unknown): {
   if (obj.app !== undefined && obj.app !== 'gbseisarray') {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
+  const tableObj = obj as unknown as Record<BackupKey, unknown>;
+  // 五张核心表必须为数组；计量站两张表为 v3 新增，旧备份缺省时补空数组（对账页提示补档）
+  const requiredKeys: ReadonlySet<BackupKey> = new Set([
+    'arrays',
+    'stations',
+    'instruments',
+    'calibrations',
+    'replaces',
+  ]);
   for (const key of BACKUP_KEYS) {
-    if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
+    const value = tableObj[key];
+    if (requiredKeys.has(key) && !Array.isArray(value)) {
+      errors.push(`${key} 字段缺失或不是数组`);
+    } else if (!requiredKeys.has(key) && value !== undefined && !Array.isArray(value)) {
+      errors.push(`${key} 字段应为数组`);
+    }
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
   const payload: BackupPayload = {
@@ -66,7 +94,9 @@ export function validateBackup(input: unknown): {
     arrays: obj.arrays ?? [],
     stations: obj.stations ?? [],
     instruments: obj.instruments ?? [],
+    channels: (obj.channels ?? []) as MeasureChannel[],
     calibrations: obj.calibrations ?? [],
+    adjustments: (obj.adjustments ?? []) as RangeAdjustment[],
     replaces: obj.replaces ?? [],
   };
   return { ok: true, errors, payload };
@@ -78,7 +108,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     arrays: payload.arrays.length,
     stations: payload.stations.length,
     instruments: payload.instruments.length,
+    channels: payload.channels.length,
     calibrations: payload.calibrations.length,
+    adjustments: payload.adjustments.length,
     replaces: payload.replaces.length,
   };
 }
@@ -117,23 +149,34 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.channels,
+      db.calibrations,
+      db.adjustments,
+      db.replaces,
+    ],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
+      await db.channels.bulkPut(payload.channels);
       await db.calibrations.bulkPut(payload.calibrations);
+      await db.adjustments.bulkPut(payload.adjustments);
       await db.replaces.bulkPut(payload.replaces);
     }
   );
   return countPayload(payload);
-}
+};
 
 /** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
 export function remapIds(payload: BackupPayload): BackupPayload {
   const arrayMap = new Map<string, string>();
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
+  const channelMap = new Map<string, string>();
 
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
@@ -150,17 +193,43 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     instrumentMap.set(row.id, id);
     return { ...row, id, stationId: stationMap.get(row.stationId) ?? row.stationId };
   });
+  // 计量站通道：重分配 id，并尽量跟随重映射后的仪器 / 台站；对不上的留空挂账
+  const channels = payload.channels.map((row) => {
+    const id = createId('ch');
+    channelMap.set(row.id, id);
+    return {
+      ...row,
+      id,
+      instrumentId: row.instrumentId ? instrumentMap.get(row.instrumentId) ?? '' : '',
+      stationId: row.stationId ? stationMap.get(row.stationId) ?? '' : '',
+    };
+  });
   const calibrations = payload.calibrations.map((row) => ({
     ...row,
     id: createId('cal'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    channelId: row.channelId ? channelMap.get(row.channelId) ?? '' : '',
+  }));
+  const adjustments = payload.adjustments.map((row) => ({
+    ...row,
+    id: createId('adj'),
+    channelId: channelMap.get(row.channelId) ?? row.channelId,
   }));
   const replaces = payload.replaces.map((row) => ({
     ...row,
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  return {
+    ...payload,
+    arrays,
+    stations,
+    instruments,
+    channels,
+    calibrations,
+    adjustments,
+    replaces,
+  };
 }
 
 /** 按台阵汇总的几何与标定结论 */

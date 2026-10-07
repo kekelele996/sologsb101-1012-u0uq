@@ -2,8 +2,12 @@
  * IndexedDB 持久化层（Dexie 封装）
  * - 库名 gbseisarray，含数据结构版本号与升级迁移逻辑
  * - 升级时按 version().stores() 补齐索引
- * - 首次打开自动播种互相引用的演示数据（台阵 → 台站 → 仪器 → 标定 / 更换）
+ * - 首次打开自动播种互相引用的演示数据（台阵 → 台站 → 仪器 → 通道 / 标定 / 更换）
  * - 纯前端应用：不依赖任何后端服务或数据库服务
+ *
+ * 两侧职责（按通道号 channelCode 对账）：
+ * - 计量站：channels（通道量程档）+ adjustments（量程调整记录，含同步状态）
+ * - 台网中心：calibrations（标定记录、当时生效档位、灵敏度变化与合格率）
  */
 import Dexie, { liveQuery, type Table } from 'dexie';
 import type { SeisArray } from '@/types/array';
@@ -12,9 +16,15 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import {
+  DEFAULT_RANGE_GEAR,
+  buildChannelCode,
+  type MeasureChannel,
+  type RangeAdjustment,
+} from '@/types/measure';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -34,7 +44,9 @@ export interface BackupPayload {
   arrays: SeisArray[];
   stations: SeisStation[];
   instruments: Instrument[];
+  channels: MeasureChannel[];
   calibrations: Calibration[];
+  adjustments: RangeAdjustment[];
   replaces: Replace[];
 }
 
@@ -42,7 +54,9 @@ export class SeisArrayDatabase extends Dexie {
   arrays!: Table<SeisArray, string>;
   stations!: Table<SeisStation, string>;
   instruments!: Table<Instrument, string>;
+  channels!: Table<MeasureChannel, string>;
   calibrations!: Table<Calibration, string>;
+  adjustments!: Table<RangeAdjustment, string>;
   replaces!: Table<Replace, string>;
 
   constructor() {
@@ -58,16 +72,28 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
+    this.version(2).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+    });
+
+    // v3：拆分两侧 —— 计量站 channels/adjustments；台网中心 calibrations 增加通道对账字段与生效档位
     this.version(DB_VERSION)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
         instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
-        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        channels: 'id, channelCode, instrumentId, stationId, currentGear, updatedAt',
+        calibrations:
+          'id, instrumentId, channelId, channelCode, date, gear, sensitivity, selfNoise, responseVerdict, updatedAt',
+        adjustments: 'id, channelId, channelCode, effectiveDate, syncState, updatedAt',
         replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
+        // v2 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
         const defaults: Array<[string, () => Record<string, unknown>]> = [
           ['arrays', () => ({ apertureKm: 0, stationCount: 0, department: '' })],
           ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', siteNote: '' })],
@@ -85,6 +111,67 @@ export class SeisArrayDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
               Object.assign(row, factory());
             });
+        }
+
+        // v3 迁移：旧标定没有量程档。按「仪器→台站→通道号」补一条默认档通道；
+        // 能对应到通道的标定回填 channelId/channelCode/gear=默认档，补不出的三个字段留空（''）单列挂账。
+        const instruments = await tx.table<Instrument, string>('instruments').toArray();
+        const stations = await tx.table<SeisStation, string>('stations').toArray();
+        const stationById = new Map(stations.map((station) => [station.id, station]));
+        const now = Date.now();
+
+        const channelByCode = new Map<string, MeasureChannel>();
+        const channelRows: MeasureChannel[] = [];
+        const ensureChannel = (instrument: Instrument): MeasureChannel | null => {
+          const station = stationById.get(instrument.stationId);
+          if (!station) return null; // 补不出通道 → 标定留空单列
+          const code = buildChannelCode(station.code, instrument.type);
+          const existing = channelByCode.get(code);
+          if (existing) return existing;
+          const channel: MeasureChannel = {
+            id: `ch_up_${channelRows.length + 1}`,
+            channelCode: code,
+            instrumentId: instrument.id,
+            stationId: station.id,
+            currentGear: DEFAULT_RANGE_GEAR,
+            component: '升级补默认档',
+            remark: '旧数据升级，按通道补默认量程档',
+            createdAt: now,
+            updatedAt: now,
+          };
+          channelByCode.set(code, channel);
+          channelRows.push(channel);
+          return channel;
+        };
+
+        // 每台仪器先确保有一条默认档通道
+        instruments.forEach((instrument) => ensureChannel(instrument));
+
+        await tx
+          .table<Calibration, string>('calibrations')
+          .toCollection()
+          .modify((row: Calibration) => {
+            if (typeof row.channelCode !== 'string') row.channelCode = '';
+            if (typeof row.channelId !== 'string') row.channelId = '';
+            if (typeof row.gear !== 'string') row.gear = '';
+            if (row.channelCode === '' || row.gear === '') {
+              const instrument = instruments.find((item) => item.id === row.instrumentId);
+              const station = instrument ? stationById.get(instrument.stationId) : undefined;
+              if (instrument && station) {
+                const code = buildChannelCode(station.code, instrument.type);
+                const channel = channelByCode.get(code) ?? ensureChannel(instrument);
+                if (channel) {
+                  row.channelCode = code;
+                  row.channelId = channel.id;
+                  row.gear = DEFAULT_RANGE_GEAR;
+                }
+              }
+              // 仍补不出：channelId/channelCode/gear 维持 ''，由对账页单列
+            }
+          });
+
+        if (channelRows.length > 0) {
+          await tx.table<MeasureChannel, string>('channels').bulkPut(channelRows);
         }
       });
   }
@@ -120,6 +207,8 @@ interface SeedCalibration {
   id: string;
   instrumentId: string;
   date: string;
+  /** 本次标定时生效的量程档 */
+  gear: Calibration['gear'];
   sensitivity: number;
   selfNoise: number;
   operator: string;
@@ -136,6 +225,8 @@ interface SeedInstrument {
   installDate: string;
   state: Instrument['state'];
   remark: string;
+  /** 通道分量说明 */
+  component: string;
   calibrations: SeedCalibration[];
 }
 
@@ -162,8 +253,10 @@ interface SeedArray {
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 8 条通道、
+ * 16 条标定（含 1 次中途换量程档）+ 3 条量程调整（1 条同步失败）+ 3 条更换。
+ * LTX01-BB 通道在 2025-03 由标准档换入高增益档：换档前后灵敏度整体抬升约 4 倍，
+ * 同档口径下跨档两条不直接相减，避免把换档阶跃看成仪器损坏。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -198,11 +291,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2021-04-18',
               state: '在用',
               remark: '主用宽频带，配 24 位采集器',
+              component: '宽频带垂直向',
               calibrations: [
                 {
                   id: 'cal_ltx01_bb_1',
                   instrumentId: 'ins_ltx01_bb',
                   date: '2023-04-20',
+                  gear: '标准档',
                   sensitivity: 1502.4,
                   selfNoise: 1.82,
                   operator: '陈立群',
@@ -213,11 +308,34 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_ltx01_bb_2',
                   instrumentId: 'ins_ltx01_bb',
                   date: '2024-04-12',
+                  gear: '标准档',
                   sensitivity: 1468.9,
                   selfNoise: 1.95,
                   operator: '陈立群',
                   agency: '省地震局计量站',
                   remark: '灵敏度略降 2.2%，仍在限内',
+                },
+                {
+                  id: 'cal_ltx01_bb_3',
+                  instrumentId: 'ins_ltx01_bb',
+                  date: '2025-03-24',
+                  gear: '高增益档',
+                  sensitivity: 5998.6,
+                  selfNoise: 1.91,
+                  operator: '陈立群',
+                  agency: '省地震局计量站',
+                  remark: '3/20 换高增益档后首次标定，读数整体抬升，跨档不作差',
+                },
+                {
+                  id: 'cal_ltx01_bb_4',
+                  instrumentId: 'ins_ltx01_bb',
+                  date: '2025-09-26',
+                  gear: '高增益档',
+                  sensitivity: 5968.1,
+                  selfNoise: 2.02,
+                  operator: '陈立群',
+                  agency: '省地震局计量站',
+                  remark: '同档相对上次变化 -0.5%，稳定',
                 },
               ],
             },
@@ -230,11 +348,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2021-04-18',
               state: '待标定',
               remark: '备份仪器，已逾标定周期',
+              component: '短周期三分量',
               calibrations: [
                 {
                   id: 'cal_ltx01_st_1',
                   instrumentId: 'ins_ltx01_st',
                   date: '2022-05-06',
+                  gear: '标准档',
                   sensitivity: 412.6,
                   selfNoise: 2.4,
                   operator: '周渝',
@@ -264,11 +384,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2022-03-15',
               state: '在用',
               remark: '井下安装，深度 42 m',
+              component: '宽频带三分量',
               calibrations: [
                 {
                   id: 'cal_ltx02_bb_1',
                   instrumentId: 'ins_ltx02_bb',
                   date: '2024-03-18',
+                  gear: '标准档',
                   sensitivity: 1204.8,
                   selfNoise: 1.42,
                   operator: '林之遥',
@@ -286,11 +408,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2022-03-15',
               state: '已停用',
               remark: '2024 年雷击损坏，已提交更换',
+              component: '短周期垂直向',
               calibrations: [
                 {
                   id: 'cal_ltx02_st_1',
                   instrumentId: 'ins_ltx02_st',
                   date: '2023-03-10',
+                  gear: '标准档',
                   sensitivity: 265.2,
                   selfNoise: 4.8,
                   operator: '周渝',
@@ -320,11 +444,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2023-09-02',
               state: '在用',
               remark: '新建站首台仪器',
+              component: '宽频带垂直向',
               calibrations: [
                 {
                   id: 'cal_ltx03_bb_1',
                   instrumentId: 'ins_ltx03_bb',
                   date: '2024-09-05',
+                  gear: '标准档',
                   sensitivity: 2251.3,
                   selfNoise: 2.05,
                   operator: '林之遥',
@@ -364,11 +490,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2019-09-25',
               state: '在用',
               remark: '海岛主用观测设备',
+              component: '宽频带三分量',
               calibrations: [
                 {
                   id: 'cal_hx01_bb_1',
                   instrumentId: 'ins_hx01_bb',
                   date: '2023-09-28',
+                  gear: '标准档',
                   sensitivity: 1498.2,
                   selfNoise: 2.25,
                   operator: '陈立群',
@@ -379,6 +507,7 @@ export async function seedDemoData(): Promise<void> {
                   id: 'cal_hx01_bb_2',
                   instrumentId: 'ins_hx01_bb',
                   date: '2024-09-30',
+                  gear: '标准档',
                   sensitivity: 1483.6,
                   selfNoise: 2.42,
                   operator: '陈立群',
@@ -396,11 +525,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2019-09-25',
               state: '在用',
               remark: '结构台阵强震观测',
+              component: '强震三分量',
               calibrations: [
                 {
                   id: 'cal_hx01_sm_1',
                   instrumentId: 'ins_hx01_sm',
                   date: '2024-09-30',
+                  gear: '标准档',
                   sensitivity: 1.24,
                   selfNoise: 1.05,
                   operator: '周渝',
@@ -430,11 +561,13 @@ export async function seedDemoData(): Promise<void> {
               installDate: '2019-09-26',
               state: '待标定',
               remark: '夜间自噪抬升，待复标',
+              component: '宽频带垂直向',
               calibrations: [
                 {
                   id: 'cal_hx02_bb_1',
                   instrumentId: 'ins_hx02_bb',
                   date: '2023-06-11',
+                  gear: '标准档',
                   sensitivity: 1388.4,
                   selfNoise: 3.9,
                   operator: '林之遥',
@@ -490,7 +623,15 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.channels,
+      db.calibrations,
+      db.adjustments,
+      db.replaces,
+    ],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -500,7 +641,10 @@ export async function seedDemoData(): Promise<void> {
       const arrayRows: SeisArray[] = [];
       const stationRows: SeisStation[] = [];
       const instrumentRows: Instrument[] = [];
+      const channelRows: MeasureChannel[] = [];
       const calibrationRows: Calibration[] = [];
+      /** instrumentId → 通道（用于把通道号回填到标定） */
+      const channelByInstrument = new Map<string, MeasureChannel>();
 
       arrays.forEach((seed, arrayIndex) => {
         const { stations, ...arrayRest } = seed;
@@ -509,20 +653,48 @@ export async function seedDemoData(): Promise<void> {
           const { instruments, ...stationRest } = stationSeed;
           stationRows.push({ ...stationRest, ...stamp(100 + arrayIndex * 100 + stationIndex) });
           instruments.forEach((instrumentSeed, instrumentIndex) => {
-            const { calibrations, ...instrumentRest } = instrumentSeed;
+            const { calibrations, component, ...instrumentRest } = instrumentSeed;
             instrumentRows.push({
               ...instrumentRest,
               ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
             });
+
+            // 每台仪器一条计量站通道，通道号 = 台站码-类型后缀
+            const code = buildChannelCode(stationSeed.code, instrumentSeed.type);
+            const lastGear = calibrations.length > 0 ? calibrations[calibrations.length - 1].gear : '标准档';
+            const channel: MeasureChannel = {
+              id: `ch_${instrumentSeed.id.slice(4)}`,
+              channelCode: code,
+              instrumentId: instrumentSeed.id,
+              stationId: stationSeed.id,
+              currentGear: lastGear || DEFAULT_RANGE_GEAR,
+              component,
+              remark: '',
+              ...stamp(250 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
+            };
+            channelRows.push(channel);
+            channelByInstrument.set(instrumentSeed.id, channel);
+
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
               const verdict = judgeCalibration(
                 instrumentRest.type,
                 calibrationSeed.sensitivity,
-                calibrationSeed.selfNoise
+                calibrationSeed.selfNoise,
+                calibrationSeed.gear
               );
               calibrationRows.push({
-                ...calibrationSeed,
+                id: calibrationSeed.id,
+                instrumentId: calibrationSeed.instrumentId,
+                channelId: channel.id,
+                channelCode: code,
+                gear: calibrationSeed.gear,
+                date: calibrationSeed.date,
+                sensitivity: calibrationSeed.sensitivity,
+                selfNoise: calibrationSeed.selfNoise,
                 responseVerdict: verdict,
+                operator: calibrationSeed.operator,
+                agency: calibrationSeed.agency,
+                remark: calibrationSeed.remark,
                 ...stamp(
                   400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
                 ),
@@ -532,10 +704,86 @@ export async function seedDemoData(): Promise<void> {
         });
       });
 
+      // 一条「计量站已建、台站仪器未装」的挂账通道（对不上，先挂着）
+      const orphanChannel: MeasureChannel = {
+        id: 'ch_ltx99_bb',
+        channelCode: 'LTX99-BB',
+        instrumentId: '',
+        stationId: '',
+        currentGear: '标准档',
+        component: '宽频带垂直向',
+        remark: '计量站先行建档，台网中心暂无对应仪器/标定，对账挂起',
+        createdAt: now,
+        updatedAt: now,
+      };
+      channelRows.push(orphanChannel);
+
+      // 量程调整记录（计量站侧）
+      const ltx01Channel = channelByInstrument.get('ins_ltx01_bb');
+      const adjustmentRows: RangeAdjustment[] = [];
+      if (ltx01Channel) {
+        adjustmentRows.push(
+          {
+            id: 'adj_ltx01_bb_init',
+            channelId: ltx01Channel.id,
+            channelCode: ltx01Channel.channelCode,
+            date: '2021-04-18',
+            effectiveDate: '2021-04-18',
+            fromGear: null,
+            toGear: '标准档',
+            reason: '建台初始量程档',
+            operator: '陈立群',
+            syncState: '已同步',
+            syncedAt: now,
+            syncError: '',
+            remark: '',
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            id: 'adj_ltx01_bb_high',
+            channelId: ltx01Channel.id,
+            channelCode: ltx01Channel.channelCode,
+            date: '2025-03-20',
+            effectiveDate: '2025-03-20',
+            fromGear: '标准档',
+            toGear: '高增益档',
+            reason: '弱震监视需要，提高数采增益',
+            operator: '陈立群',
+            syncState: '已同步',
+            syncedAt: now,
+            syncError: '',
+            remark: '换档后灵敏度读数整体抬升约 4 倍，属增益阶跃',
+            createdAt: now,
+            updatedAt: now,
+          }
+        );
+      }
+      // 一条同步失败的调整（计量站写不进台网中心）：只在计量站侧，可补跑，不回退台网已认标定
+      adjustmentRows.push({
+        id: 'adj_ltx99_bb_fail',
+        channelId: orphanChannel.id,
+        channelCode: orphanChannel.channelCode,
+        date: daysAgo(8),
+        effectiveDate: daysAgo(8),
+        fromGear: '标准档',
+        toGear: '高增益档',
+        reason: '近震频发，计划提高增益',
+        operator: '周渝',
+        syncState: '同步失败',
+        syncedAt: now - 8 * 86400000,
+        syncError: '台网中心接口超时（模拟），调整已在计量站生效，待补跑同步',
+        remark: '',
+        createdAt: now - 8 * 86400000,
+        updatedAt: now - 8 * 86400000,
+      });
+
       await db.arrays.bulkPut(arrayRows);
       await db.stations.bulkPut(stationRows);
       await db.instruments.bulkPut(instrumentRows);
+      await db.channels.bulkPut(channelRows);
       await db.calibrations.bulkPut(calibrationRows);
+      await db.adjustments.bulkPut(adjustmentRows);
       await db.replaces.bulkPut(replaces);
     }
   );
@@ -555,13 +803,23 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.channels,
+      db.calibrations,
+      db.adjustments,
+      db.replaces,
+    ],
     async () => {
       await Promise.all([
         db.arrays.clear(),
         db.stations.clear(),
         db.instruments.clear(),
+        db.channels.clear(),
         db.calibrations.clear(),
+        db.adjustments.clear(),
         db.replaces.clear(),
       ]);
     }
@@ -576,14 +834,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.count(),
-    db.stations.count(),
-    db.instruments.count(),
-    db.calibrations.count(),
-    db.replaces.count(),
-  ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  const [arrays, stations, instruments, channels, calibrations, adjustments, replaces] =
+    await Promise.all([
+      db.arrays.count(),
+      db.stations.count(),
+      db.instruments.count(),
+      db.channels.count(),
+      db.calibrations.count(),
+      db.adjustments.count(),
+      db.replaces.count(),
+    ]);
+  return { arrays, stations, instruments, channels, calibrations, adjustments, replaces };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */
