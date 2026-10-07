@@ -14,21 +14,35 @@ import {
 import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
-/** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+/** 备份集合键名（五张核心表 + 计量站侧两张表） */
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'ranges',
+  'rangeAdjustments',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
+
+/** 旧备份可能缺失的表：导入校验时容忍缺省，按空表处理 */
+export const BACKUP_OPTIONAL_KEYS: BackupKey[] = ['ranges', 'rangeAdjustments'];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.toArray(),
-    db.stations.toArray(),
-    db.instruments.toArray(),
-    db.calibrations.toArray(),
-    db.replaces.toArray(),
-  ]);
+  const [arrays, stations, instruments, calibrations, replaces, ranges, rangeAdjustments] =
+    await Promise.all([
+      db.arrays.toArray(),
+      db.stations.toArray(),
+      db.instruments.toArray(),
+      db.calibrations.toArray(),
+      db.replaces.toArray(),
+      db.ranges.toArray(),
+      db.rangeAdjustments.toArray(),
+    ]);
   return {
     app: 'gbseisarray',
     dbVersion: DB_VERSION,
@@ -38,6 +52,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    ranges,
+    rangeAdjustments,
   };
 }
 
@@ -56,6 +72,8 @@ export function validateBackup(input: unknown): {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
   for (const key of BACKUP_KEYS) {
+    // 计量站侧两张表为 v3 新增：旧备份缺失时按空表处理，不算校验失败
+    if (BACKUP_OPTIONAL_KEYS.includes(key)) continue;
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
@@ -68,6 +86,8 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    ranges: Array.isArray(obj.ranges) ? obj.ranges : [],
+    rangeAdjustments: Array.isArray(obj.rangeAdjustments) ? obj.rangeAdjustments : [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +100,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    ranges: payload.ranges.length,
+    rangeAdjustments: payload.rangeAdjustments.length,
   };
 }
 
@@ -117,13 +139,15 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.ranges, db.rangeAdjustments],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.ranges.bulkPut(payload.ranges);
+      await db.rangeAdjustments.bulkPut(payload.rangeAdjustments);
     }
   );
   return countPayload(payload);
@@ -134,6 +158,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const arrayMap = new Map<string, string>();
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
+  const rangeMap = new Map<string, string>();
 
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
@@ -150,17 +175,30 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     instrumentMap.set(row.id, id);
     return { ...row, id, stationId: stationMap.get(row.stationId) ?? row.stationId };
   });
+  // 计量站侧：档位重排 id，标定与调整记录里的档位引用一并映射
+  const ranges = payload.ranges.map((row) => {
+    const id = createId('rng');
+    rangeMap.set(row.id, id);
+    return { ...row, id };
+  });
+  const rangeAdjustments = payload.rangeAdjustments.map((row) => ({
+    ...row,
+    id: createId('adj'),
+    fromRangeId: row.fromRangeId ? rangeMap.get(row.fromRangeId) ?? row.fromRangeId : null,
+    toRangeId: rangeMap.get(row.toRangeId) ?? row.toRangeId,
+  }));
   const calibrations = payload.calibrations.map((row) => ({
     ...row,
     id: createId('cal'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    rangeId: row.rangeId ? rangeMap.get(row.rangeId) ?? row.rangeId : null,
   }));
   const replaces = payload.replaces.map((row) => ({
     ...row,
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, ranges, rangeAdjustments };
 }
 
 /** 按台阵汇总的几何与标定结论 */

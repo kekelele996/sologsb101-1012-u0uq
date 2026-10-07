@@ -3,7 +3,7 @@ export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
 export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待判定'];
 
-/** 标定：同一仪器可叠加多次标定记录 */
+/** 标定：同一仪器可叠加多次标定记录（台网中心侧档案） */
 export interface Calibration {
   id: string;
   /** 被标定仪器 */
@@ -16,6 +16,10 @@ export interface Calibration {
   selfNoise: number;
   /** 脉冲响应结论 */
   responseVerdict: ResponseVerdict;
+  /** 标定当时生效的量程档（计量站侧档案 id，null 表示计量站侧缺档、待对账） */
+  rangeId: string | null;
+  /** 通道号（冗余仪器序列号，两侧对账键） */
+  channelCode: string;
   /** 标定人 */
   operator: string;
   /** 标定机构 */
@@ -58,14 +62,41 @@ export interface SensitivityDelta {
   percent: number;
   /** 是否有上一次标定可比 */
   comparable: boolean;
+  /** 是否因跨量程档而不可比（换档跳变不算仪器漂移） */
+  crossRange: boolean;
 }
 
 export function sensitivityDelta(current: number, previous: number | null): SensitivityDelta {
   if (previous === null || !Number.isFinite(previous) || previous === 0) {
-    return { absolute: 0, percent: 0, comparable: false };
+    return { absolute: 0, percent: 0, comparable: false, crossRange: false };
   }
   const absolute = Number((current - previous).toFixed(2));
-  return { absolute, percent: Number(((absolute / previous) * 100).toFixed(2)), comparable: true };
+  return {
+    absolute,
+    percent: Number(((absolute / previous) * 100).toFixed(2)),
+    comparable: true,
+    crossRange: false,
+  };
+}
+
+/** 灵敏度漂移稳定限（%）：同档比较下超过该值视为漂移异常 */
+export const SENSITIVITY_DRIFT_LIMIT = 5;
+
+/**
+ * 同档灵敏度变化（台网中心统一口径）：
+ * 只与同一量程档内的前一次标定比较；跨档两条不直接相减，
+ * 避免数采中途换档造成的读数整体跳变被误判为仪器损坏。
+ * 灵敏度趋势图与灵敏度稳定率共用这一口径。
+ */
+export function sensitivityDeltaSameRange(
+  current: Pick<Calibration, 'sensitivity' | 'rangeId'>,
+  previous: Pick<Calibration, 'sensitivity' | 'rangeId'> | null
+): SensitivityDelta {
+  if (!previous) return { absolute: 0, percent: 0, comparable: false, crossRange: false };
+  if ((current.rangeId ?? null) !== (previous.rangeId ?? null)) {
+    return { absolute: 0, percent: 0, comparable: false, crossRange: true };
+  }
+  return sensitivityDelta(current.sensitivity, previous.sensitivity);
 }
 
 /** 标定页筛选条件（存于 calibrationSlice） */

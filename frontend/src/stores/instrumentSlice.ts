@@ -3,7 +3,7 @@
  * 序列号唯一性校验与「登记后自动生成下一次标定待办」在本 slice 的动作里完成。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { db, createId, watchTable } from '@/utils/db';
+import { db, createId, watchTable, createDefaultRangeForChannel } from '@/utils/db';
 import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
 import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
 import type { RootState } from '@/stores/store';
@@ -54,9 +54,17 @@ export const createInstrument = createAsyncThunk(
     const now = Date.now();
     const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
     await db.instruments.put(row);
+    // 计量站侧：为通道建默认量程档；本侧写失败不影响仪器档案（对账时按挂起处理）
+    let rangeReady = false;
+    try {
+      await createDefaultRangeForChannel(row.serialNo, row.installDate);
+      rangeReady = true;
+    } catch {
+      rangeReady = false;
+    }
     // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
     const dueInDays = daysUntilDue(null, row.installDate);
-    return { row, dueInDays };
+    return { row, dueInDays, rangeReady };
   }
 );
 
@@ -149,10 +157,11 @@ const instrumentSlice = createSlice({
     builder
       .addCase(createInstrument.fulfilled, (state, action) => {
         const dueInDays = action.payload.dueInDays;
+        const rangeNote = action.payload.rangeReady ? '，计量站侧默认量程档已建档' : '，计量站侧默认档待补建（对账挂起）';
         state.lastReceipt =
           dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天，请按期安排标定`
-            : `仪器已登记，但安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`;
+            ? `仪器已登记，距下次标定 ${dueInDays} 天，请按期安排标定${rangeNote}`
+            : `仪器已登记，但安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定${rangeNote}`;
         state.error = null;
       })
       .addCase(createInstrument.rejected, (state, action) => {

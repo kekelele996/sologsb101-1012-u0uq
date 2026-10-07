@@ -3,13 +3,20 @@
  * 同时维护更换记录（合格评定与更换提醒同属标定成果的下游动作）。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { db, createId, watchTable } from '@/utils/db';
+import {
+  db,
+  createId,
+  watchTable,
+  createDefaultRangeForChannel,
+  enqueueMetrologyPending,
+} from '@/utils/db';
 import type {
   Calibration,
   CalibrationFilterState,
   ResponseVerdict,
 } from '@/types/calibration';
-import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from '@/types/calibration';
+import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDeltaSameRange } from '@/types/calibration';
+import { activeRangeOf } from '@/types/range';
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
@@ -43,22 +50,48 @@ const initialState: CalibrationSliceState = {
 
 export const createCalibration = createAsyncThunk(
   'calibration/createCalibration',
-  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict'>) => {
+  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict' | 'rangeId' | 'channelCode'>) => {
     const now = Date.now();
     const instrument = await db.instruments.get(payload.instrumentId);
+    const channelCode = instrument?.serialNo ?? '';
+    // 每条标定记下当时生效档位：先查计量站侧该通道在标定日期的生效档
+    const channelRanges = channelCode
+      ? await db.ranges.where('channelCode').equals(channelCode).toArray()
+      : [];
+    let rangeId = activeRangeOf(channelRanges, channelCode, payload.date)?.id ?? null;
+    let metrologyFailed = false;
+    if (!rangeId && channelCode) {
+      // 计量站侧缺档：尝试补建默认档；本侧写不进去只挂待补跑，标定照常落库不回退
+      try {
+        rangeId = await createDefaultRangeForChannel(channelCode, payload.date);
+      } catch {
+        metrologyFailed = true;
+      }
+    }
     const verdict = judgeCalibration(
       instrument?.type ?? '宽频带',
       payload.sensitivity,
       payload.selfNoise
     );
+    // 台网中心侧：认下标定记录（计量站侧失败不回退本记录）
     const row: Calibration = {
       ...payload,
+      channelCode,
+      rangeId,
       responseVerdict: verdict,
       id: createId('cal'),
       createdAt: now,
       updatedAt: now,
     };
     await db.calibrations.put(row);
+    if (metrologyFailed) {
+      enqueueMetrologyPending({
+        channelCode,
+        date: payload.date,
+        calibrationId: row.id,
+        enqueuedAt: new Date(now).toISOString(),
+      });
+    }
     // 标定完成后按结论回写仪器状态
     if (instrument) {
       await db.instruments.update(instrument.id, {
@@ -282,11 +315,11 @@ export const selectReplacesOfInstrument = (
   return state.calibration.replaces.filter((row) => row.instrumentId === instrumentId);
 };
 
-/** 标定 id → 灵敏度变化（相对同仪器上一次标定） */
+/** 标定 id → 灵敏度变化（同档口径：只与同一量程档内的前一次标定比较，跨档不直接相减） */
 export const selectSensitivityDeltas = (
   state: WithCalibration
-): Record<string, ReturnType<typeof sensitivityDelta>> => {
-  const result: Record<string, ReturnType<typeof sensitivityDelta>> = {};
+): Record<string, ReturnType<typeof sensitivityDeltaSameRange>> => {
+  const result: Record<string, ReturnType<typeof sensitivityDeltaSameRange>> = {};
   const grouped = new Map<string, Calibration[]>();
   state.calibration.calibrations.forEach((row) => {
     const list = grouped.get(row.instrumentId) ?? [];
@@ -296,8 +329,17 @@ export const selectSensitivityDeltas = (
   grouped.forEach((list) => {
     const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
     sorted.forEach((row, index) => {
-      const previous = index > 0 ? sorted[index - 1].sensitivity : null;
-      result[row.id] = sensitivityDelta(row.sensitivity, previous);
+      const previousSameRange =
+        sorted
+          .slice(0, index)
+          .reverse()
+          .find((item) => (item.rangeId ?? null) === (row.rangeId ?? null)) ?? null;
+      if (previousSameRange) {
+        result[row.id] = sensitivityDeltaSameRange(row, previousSameRange);
+      } else {
+        // 同档无前次：若之前有跨档记录则标记换档，否则为首次标定
+        result[row.id] = { absolute: 0, percent: 0, comparable: false, crossRange: index > 0 };
+      }
     });
   });
   return result;

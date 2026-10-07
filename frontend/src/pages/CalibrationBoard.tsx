@@ -1,6 +1,8 @@
 /**
- * 模块 3：/calibrations 标定记录台
+ * 模块 3：/calibrations 标定记录台（台网中心侧）
  * 录入灵敏度 / 自噪 / 脉冲响应结论并批量改结论，叠加多次标定并绘出灵敏度趋势。
+ * 灵敏度变化与稳定率按同档口径：只与同一量程档内的前一次标定比较，跨档不直接相减；
+ * 量程档与调整记录归计量站侧（下方 <RangeBoard>），两侧按通道号对账（<ReconcilePanel>）。
  * 复用 <FilterBar>、<QualifyTag>、<EmptyPanel>。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -30,9 +32,12 @@ import type { FilterModel } from '@/types/filter';
 import StatBadge from '@/components/common/StatBadge';
 import QualifyTag from '@/components/common/QualifyTag';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import RangeBoard from '@/components/common/RangeBoard';
+import ReconcilePanel from '@/components/common/ReconcilePanel';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectRangeById, selectReconcileIssues } from '@/stores/rangeSlice';
 import {
   bulkSetVerdict,
   createCalibration,
@@ -46,12 +51,14 @@ import {
 import {
   RESPONSE_VERDICTS,
   SELF_NOISE_LIMIT,
+  SENSITIVITY_DRIFT_LIMIT,
   SENSITIVITY_RANGE,
   createEmptyCalibrationFilter,
   judgeCalibration,
-  sensitivityDelta,
+  sensitivityDeltaSameRange,
   type Calibration,
   type ResponseVerdict,
+  type SensitivityDelta,
 } from '@/types/calibration';
 import { INSTRUMENT_TYPES, type InstrumentType } from '@/types/instrument';
 import { round } from '@/utils/geo';
@@ -68,7 +75,7 @@ interface CalibrationFormValues {
   remark: string;
 }
 
-/** 标定行：附带仪器、台站、台阵信息与灵敏度变化 */
+/** 标定行：附带仪器、台站、台阵信息、量程档与灵敏度变化 */
 interface CalibrationRow {
   row: Calibration;
   instrumentModel: string;
@@ -77,7 +84,9 @@ interface CalibrationRow {
   stationCode: string;
   arrayName: string;
   arrayId: string;
-  delta: ReturnType<typeof sensitivityDelta>;
+  /** 当时生效档位名（无档位为 null，对账挂起） */
+  rangeLabel: string | null;
+  delta: SensitivityDelta;
 }
 
 export default function CalibrationBoard() {
@@ -91,6 +100,8 @@ export default function CalibrationBoard() {
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
   const filter = useAppSelector(selectCalibrationFilter);
+  const rangeById = useAppSelector(selectRangeById);
+  const reconcileIssues = useAppSelector(selectReconcileIssues);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -132,7 +143,7 @@ export default function CalibrationBoard() {
     return map;
   }, [arrays, instruments, stations]);
 
-  /** 逐仪器排序后的标定序列，用于计算灵敏度变化 */
+  /** 逐仪器排序后的标定序列，按同档口径计算灵敏度变化（跨档两条不直接相减） */
   const deltaIndex = useMemo(() => {
     const grouped = new Map<string, Calibration[]>();
     calibrations.forEach((row) => {
@@ -140,11 +151,20 @@ export default function CalibrationBoard() {
       list.push(row);
       grouped.set(row.instrumentId, list);
     });
-    const result = new Map<string, ReturnType<typeof sensitivityDelta>>();
+    const result = new Map<string, SensitivityDelta>();
     grouped.forEach((list) => {
       const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
       sorted.forEach((row, index) => {
-        result.set(row.id, sensitivityDelta(row.sensitivity, index > 0 ? sorted[index - 1].sensitivity : null));
+        const previousSameRange =
+          sorted
+            .slice(0, index)
+            .reverse()
+            .find((item) => (item.rangeId ?? null) === (row.rangeId ?? null)) ?? null;
+        if (previousSameRange) {
+          result.set(row.id, sensitivityDeltaSameRange(row, previousSameRange));
+        } else {
+          result.set(row.id, { absolute: 0, percent: 0, comparable: false, crossRange: index > 0 });
+        }
       });
     });
     return result;
@@ -162,7 +182,8 @@ export default function CalibrationBoard() {
           stationCode: info?.stationCode ?? '—',
           arrayName: info?.arrayName ?? '—',
           arrayId: info?.arrayId ?? '',
-          delta: deltaIndex.get(row.id) ?? sensitivityDelta(row.sensitivity, null),
+          rangeLabel: row.rangeId ? rangeById.get(row.rangeId)?.label ?? '档位已删除' : null,
+          delta: deltaIndex.get(row.id) ?? { absolute: 0, percent: 0, comparable: false, crossRange: false },
         };
       })
       .filter((item) => {
@@ -177,7 +198,7 @@ export default function CalibrationBoard() {
         return true;
       })
       .sort((a, b) => b.row.date.localeCompare(a.row.date));
-  }, [calibrations, deltaIndex, filter, instrumentIndex]);
+  }, [calibrations, deltaIndex, filter, instrumentIndex, rangeById]);
 
   const totals = useMemo(() => {
     const unqualified = rows.filter((item) => item.row.responseVerdict === '不合格').length;
@@ -187,6 +208,9 @@ export default function CalibrationBoard() {
         : round(rows.reduce((sum, item) => sum + item.row.sensitivity, 0) / rows.length, 1);
     const meanNoise =
       rows.length === 0 ? 0 : round(rows.reduce((sum, item) => sum + item.row.selfNoise, 0) / rows.length, 2);
+    // 灵敏度稳定率：与趋势图同一口径——只统计同档可比的记录，跨档换档不计入
+    const comparable = rows.filter((item) => item.delta.comparable);
+    const stable = comparable.filter((item) => Math.abs(item.delta.percent) <= SENSITIVITY_DRIFT_LIMIT);
     return {
       count: rows.length,
       unqualified,
@@ -194,6 +218,8 @@ export default function CalibrationBoard() {
       meanSensitivity,
       meanNoise,
       operatorCount: new Set(rows.map((item) => item.row.operator)).size,
+      comparableCount: comparable.length,
+      stableRate: comparable.length === 0 ? 0 : round((stable.length / comparable.length) * 100, 1),
     };
   }, [rows]);
 
@@ -309,11 +335,17 @@ export default function CalibrationBoard() {
     setSearchParams(new URLSearchParams(), { replace: true });
   };
 
-  /** 灵敏度趋势图坐标 */
+  /** 灵敏度趋势图坐标：按量程档分段，跨档断开（与灵敏度稳定率同一口径） */
   const trendChart = useMemo(() => {
     const points = trendRows.points;
     if (points.length === 0) {
-      return { line: '', dots: [] as Array<{ id: string; cx: number; cy: number; date: string; sensitivity: number }>, min: 0, max: 0 };
+      return {
+        segments: [] as Array<{ key: string; line: string }>,
+        dots: [] as Array<{ id: string; cx: number; cy: number; date: string; sensitivity: number }>,
+        switches: [] as Array<{ key: string; x: number; label: string }>,
+        min: 0,
+        max: 0,
+      };
     }
     const sensitivities = points.map((row) => row.sensitivity);
     const min = Math.min(...sensitivities) * 0.98;
@@ -332,9 +364,26 @@ export default function CalibrationBoard() {
       cy: Number(toY(row.sensitivity).toFixed(1)),
       date: row.date,
       sensitivity: row.sensitivity,
+      rangeId: row.rangeId ?? null,
     }));
-    return { line: dots.map((dot) => `${dot.cx},${dot.cy}`).join(' '), dots, min, max };
-  }, [trendRows]);
+    // 连续同档位为一段；跨档处断开并标注新生效档位
+    const segments: Array<{ key: string; line: string }> = [];
+    const switches: Array<{ key: string; x: number; label: string }> = [];
+    let current: typeof dots = [];
+    dots.forEach((dot, index) => {
+      if (index > 0 && (dot.rangeId ?? null) !== (dots[index - 1].rangeId ?? null)) {
+        segments.push({ key: `seg-${segments.length}`, line: current.map((d) => `${d.cx},${d.cy}`).join(' ') });
+        const label = dot.rangeId ? rangeById.get(dot.rangeId)?.label ?? '新档位' : '缺档';
+        switches.push({ key: `sw-${dot.id}`, x: dot.cx, label: `换档→${label}` });
+        current = [];
+      }
+      current.push(dot);
+    });
+    if (current.length > 0) {
+      segments.push({ key: `seg-${segments.length}`, line: current.map((d) => `${d.cx},${d.cy}`).join(' ') });
+    }
+    return { segments, dots, switches, min, max };
+  }, [trendRows, rangeById]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -348,6 +397,7 @@ export default function CalibrationBoard() {
           <p className="gb-hint">
             录入灵敏度、自噪与脉冲响应结论，系统按类型灵敏度区间（宽频带 {SENSITIVITY_RANGE.宽频带.min} ~{' '}
             {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（{SELF_NOISE_LIMIT}）自动初判；可勾选批量改结论。
+            灵敏度变化与稳定率按同档口径：只与同一量程档内的前一次标定比较，跨档换档不直接相减。
           </p>
         </div>
         <Space wrap>
@@ -369,10 +419,22 @@ export default function CalibrationBoard() {
           tone={totals.unqualified > 0 ? 'danger' : 'success'}
         />
         <StatBadge label="合格率" value={totals.qualifyRate} percent={totals.qualifyRate} tone="success" />
+        <StatBadge
+          label="灵敏度稳定率"
+          value={totals.stableRate}
+          percent={totals.stableRate}
+          tone={totals.stableRate < 100 ? 'warning' : 'info'}
+        />
         <StatBadge label="平均灵敏度" value={totals.meanSensitivity} suffix="V·s/m" tone="info" />
         <StatBadge label="平均自噪" value={totals.meanNoise} suffix="" tone="warning" />
         <StatBadge label="标定人" value={totals.operatorCount} suffix="人" tone="default" />
       </div>
+
+      {reconcileIssues.length > 0 ? (
+        <p className="gb-hint">
+          两侧对账有 {reconcileIssues.length} 条挂起，详见页面底部「两侧对账与补跑」。
+        </p>
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}
@@ -450,6 +512,16 @@ export default function CalibrationBoard() {
             },
             { title: '标定日期', dataIndex: ['row', 'date'], width: 120, className: 'gb-mono' },
             {
+              title: '量程档',
+              width: 110,
+              render: (_: unknown, item: CalibrationRow) =>
+                item.rangeLabel ? (
+                  <Tag>{item.rangeLabel}</Tag>
+                ) : (
+                  <Tag color="orange">缺档挂起</Tag>
+                ),
+            },
+            {
               title: '灵敏度 (V·s/m)',
               width: 150,
               align: 'right',
@@ -457,9 +529,13 @@ export default function CalibrationBoard() {
                 <div>
                   <span className="gb-mono">{item.row.sensitivity}</span>
                   {item.delta.comparable ? (
-                    <div className={Math.abs(item.delta.percent) > 5 ? 'gb-danger gb-hint' : 'gb-hint'}>
+                    <div className={Math.abs(item.delta.percent) > SENSITIVITY_DRIFT_LIMIT ? 'gb-danger gb-hint' : 'gb-hint'}>
                       变化 {item.delta.absolute > 0 ? '+' : ''}
                       {item.delta.absolute}（{item.delta.percent}%）
+                    </div>
+                  ) : item.delta.crossRange ? (
+                    <div className="gb-hint" style={{ color: '#d68910' }}>
+                      换档不比（跨量程档）
                     </div>
                   ) : (
                     <div className="gb-hint">首次标定</div>
@@ -564,7 +640,19 @@ export default function CalibrationBoard() {
               <text x="8" y="194" className="gb-chart-axis">
                 {round(trendChart.min, 0)}
               </text>
-              <polyline points={trendChart.line} fill="none" stroke="#1e3a5f" strokeWidth="2" />
+              {trendChart.switches.map((sw) => (
+                <g key={sw.key}>
+                  <line x1={sw.x} y1="20" x2={sw.x} y2="190" stroke="#d68910" strokeDasharray="4 3" />
+                  <text x={Math.min(sw.x + 4, 250)} y="32" className="gb-chart-axis" fill="#d68910">
+                    {sw.label}
+                  </text>
+                </g>
+              ))}
+              {trendChart.segments.map((segment) =>
+                segment.line ? (
+                  <polyline key={segment.key} points={segment.line} fill="none" stroke="#1e3a5f" strokeWidth="2" />
+                ) : null
+              )}
               {trendChart.dots.map((dot) => (
                 <g key={dot.id}>
                   <circle cx={dot.cx} cy={dot.cy} r="4.5" fill="#7fd1e8" stroke="#1e3a5f" />
@@ -575,12 +663,17 @@ export default function CalibrationBoard() {
               ))}
             </svg>
             <p className="gb-hint">
-              纵轴为灵敏度（V·s/m），横轴为标定日期；共 {trendChart.dots.length} 次标定。灵敏度变化超过 5%
-              会以红色提示，供判断仪器漂移趋势。
+              纵轴为灵敏度（V·s/m），横轴为标定日期；共 {trendChart.dots.length} 次标定。
+              趋势按量程档分段：跨档处断开并以虚线标注新档位，跨档两条不直接相减；
+              同档变化超过 {SENSITIVITY_DRIFT_LIMIT}% 会以红色提示，与灵敏度稳定率同一口径。
             </p>
           </>
         )}
       </Card>
+
+      <RangeBoard />
+
+      <ReconcilePanel />
 
       <p className="gb-hint">
         需要处理超期或不合格仪器？前往
